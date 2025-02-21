@@ -1,9 +1,14 @@
+require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { createWriteStream, existsSync, mkdirSync } = require('fs');
+const path = require('path');
+const WebSocket = require('ws');
+const Patient = require('./models/Patient');
 
 // Ensure logs directory exists with proper permissions
 const logsDir = path.join(__dirname, 'logs');
@@ -20,40 +25,35 @@ try {
 // Create error log stream
 const errorLogStream = createWriteStream(path.join(logsDir, 'error.log'), { flags: 'a' });
 
+// Initialize Express app
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
-// Configure body-parser middleware
+// Database connection
+mongoose.connect(process.env.MONGO_URI, {
+  dbName: process.env.DB_NAME
+})
+.then(() => console.log('Connected to MongoDB'))
+.catch(err => console.error('MongoDB connection error:', err));
+
+// Security middleware
+app.use(helmet());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: process.env.RATE_LIMIT_WINDOW * 60 * 1000, // 15 minutes
+  max: process.env.RATE_LIMIT_MAX // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+// Configure middleware
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
+app.use(cors());
 
-// Ensure data directory exists with proper permissions
-const dataDir = path.join(__dirname, 'data');
-try {
-  if (!existsSync(dataDir)) {
-    mkdirSync(dataDir, { recursive: true, mode: 0o755 });
-    console.log(`Created data directory at ${dataDir}`);
-  }
-} catch (err) {
-  console.error(`Failed to create data directory: ${err.message}`);
-  process.exit(1);
-}
-
-// File path for persistent storage
-const dataFilePath = path.join(dataDir, 'patients.json');
-
-// Load patients from file or initialize empty array
-let patients = [];
-try {
-  if (fs.existsSync(dataFilePath)) {
-    patients = JSON.parse(fs.readFileSync(dataFilePath));
-  }
-} catch (err) {
-  console.error('Error loading patients data:', err);
-}
 
 // Patient registration endpoint
-app.post('/api/patients', (req, res) => {
+app.post('/api/patients', async (req, res) => {
   const patient = req.body;
   
   // Basic validation
@@ -62,14 +62,14 @@ app.post('/api/patients', (req, res) => {
     return res.status(400).json({ error: 'All fields are required' });
   }
 
-  // Add patient to storage
-  patients.push(patient);
-  
-  // Save to file
+  // Create new patient document
   try {
-    fs.writeFileSync(dataFilePath, JSON.stringify(patients));
-    console.log(`Patient data saved successfully to ${dataFilePath}`);
-    res.status(201).json({ message: 'Patient registered successfully', patient });
+    const newPatient = await Patient.create(patient);
+    console.log('Patient registered successfully:', newPatient);
+    res.status(201).json({ 
+      message: 'Patient registered successfully',
+      patient: newPatient
+    });
   } catch (err) {
     const errorMessage = `[${new Date().toISOString()}] Error saving patient data: ${err.message}\n` +
                          `File path: ${dataFilePath}\n` +
@@ -95,22 +95,65 @@ app.post('/api/patients', (req, res) => {
 });
 
 // Patient search endpoint
-app.get('/api/patients/search', (req, res) => {
+app.get('/api/patients/search', async (req, res) => {
   const { name } = req.query;
   
   if (!name) {
     return res.status(400).json({ error: 'Name parameter is required' });
   }
 
-  const searchResults = patients.filter(patient => 
-    patient.firstName.toLowerCase().includes(name.toLowerCase()) || 
-    patient.lastName.toLowerCase().includes(name.toLowerCase())
-  );
+  const searchResults = await Patient.find({
+    $or: [
+      { firstName: { $regex: name, $options: 'i' } },
+      { lastName: { $regex: name, $options: 'i' } }
+    ]
+  });
 
   res.json(searchResults);
 });
 
-// Start the server
-app.listen(PORT, () => {
+// Start the server with port fallback
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+});
+
+// Create WebSocket server
+const wss = new WebSocket.Server({ server, path: '/ws' });
+
+wss.on('connection', (ws) => {
+  console.log('New WebSocket connection');
+
+  ws.on('message', (message) => {
+    console.log(`Received message: ${message}`);
+    // Broadcast message to all clients
+    wss.clients.forEach(client => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(message);
+      }
+    });
+  });
+
+  ws.on('close', () => {
+    console.log('WebSocket connection closed');
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
+  });
+});
+
+console.log(`WebSocket server running on ws://localhost:${PORT}/ws`);
+
+// Handle port in use error
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    const fallbackPort = PORT + 1;
+    console.log(`Port ${PORT} is in use, trying port ${fallbackPort}...`);
+    app.listen(fallbackPort, () => {
+      console.log(`Server running on port ${fallbackPort}`);
+    });
+  } else {
+    console.error('Server error:', error);
+    process.exit(1);
+  }
 });
